@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # Script to download and extract FENDL 3.2c nuclear data
+# before runnung this script
+# pip install openmc_data
+# install njoy and openmc
+# generate_fendl -r 3.2c
 
 import glob
 import json
@@ -11,6 +15,9 @@ from typing import Optional
 import numpy as np
 import openmc
 
+# Import monkey patches to add simplified methods to OpenMC classes
+from openmc_patches import *
+
 
 class CompactJSONEncoder(json.JSONEncoder):
     """A JSON Encoder that puts arrays of primitives on a single line."""
@@ -19,6 +26,9 @@ class CompactJSONEncoder(json.JSONEncoder):
         # Default to 2-space indentation if not specified
         if kwargs.get("indent") is None:
             kwargs["indent"] = 2
+        # Ensure compact separators (no spaces) for arrays
+        if kwargs.get("separators") is None:
+            kwargs["separators"] = (',', ':')
         super().__init__(*args, **kwargs)
         self.indentation_level = 0
 
@@ -37,7 +47,7 @@ class CompactJSONEncoder(json.JSONEncoder):
         if isinstance(o, (list, tuple)):
             # Put arrays of primitives on a single line
             if all(isinstance(x, (int, float, bool, str, type(None))) for x in o):
-                return "[" + ", ".join(json.dumps(el) for el in o) + "]"
+                return "[" + ",".join(json.dumps(el) for el in o) + "]"
             # For other containers, use standard formatting
             return self._encode_container(o, "[", "]")
         if isinstance(o, dict):
@@ -101,160 +111,67 @@ class CompactJSONEncoder(json.JSONEncoder):
 
 
 def extract_cross_section_data(
-    h5_filename: str, json_filename: Optional[str] = None
+    h5_filename: str,
+    library: str,
+    json_filename: Optional[str] = None,
 ) -> dict:
-    """Extract cross section data from HDF5 and write to JSON."""
-    # Add sum rules for hierarchical MTs, avoid formatting this code block to keep it compact
-    # fmt: off
-    SUM_RULES = {
-        1: [2, 3],
-        3: [4, 5, 11, 16, 17, 22, 23, 24, 25, 27, 28, 29, 30, 32, 33, 34, 35,
-            36, 37, 41, 42, 44, 45, 152, 153, 154, 156, 157, 158, 159, 160,
-            161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
-            173, 174, 175, 176, 177, 178, 179, 180, 181, 183, 184, 185,
-            186, 187, 188, 189, 190, 194, 195, 196, 198, 199, 200],
-        4: list(range(50, 92)),
-        16: list(range(875, 892)),
-        18: [19, 20, 21, 38],
-        27: [18, 101],
-        101: [102, 103, 104, 105, 106, 107, 108, 109, 111, 112, 113, 114,
-              115, 116, 117, 155, 182, 191, 192, 193, 197],
-        103: list(range(600, 650)),
-        104: list(range(650, 700)),
-        105: list(range(700, 750)),
-        106: list(range(750, 800)),
-        107: list(range(800, 850)),
-    }
-    # fmt: on
-
-    result = {}
-
+    """Extract cross section data and scattering data from HDF5 and write to JSON using OpenMC monkey patches."""
+    
+    # Load the isotope data
     isotope_object = openmc.data.IncidentNeutron.from_hdf5(h5_filename)
-    result["atomic_number"] = isotope_object.atomic_number
-    result["atomic_symbol"] = isotope_object.atomic_symbol
-    result["atomic_weight_ratio"] = isotope_object.atomic_weight_ratio
-    result["mass_number"] = isotope_object.mass_number
-    result["metastable"] = isotope_object.metastable
-    result["nuclide"] = isotope_object.name
-    result["temperatures"] = [
-        str(temp).replace("K", "") for temp in isotope_object.temperatures
-    ]
-
-    result["reactions"] = {}
-
-    # Collect all unique temperatures first
-    all_temperatures = set()
-    for reaction in isotope_object.reactions.values():
-        all_temperatures.update(
-            str(temp).replace("K", "") for temp in reaction.xs.keys()
-        )
-
-    # Initialize the nested structure once
-    for temperature in all_temperatures:
-        result["reactions"][temperature.replace("K", "")] = {}
-
-    result["energy"] = {}
-    for temperature, energy in isotope_object.energy.items():
-        result["energy"][temperature.replace("K", "")] = energy
-
+    isotope_object.library = library
+    
+    # Use monkey patch to extract cross-section data with hierarchical MTs
+    result = isotope_object.add_hierarchical_mts()
+    
+    # Extract scattering data and integrate into each reaction
+    print(f"Extracting scattering data for {isotope_object.name}...")
+    scattering_count = 0
+    
     for reaction_mt, reaction in isotope_object.reactions.items():
-        temperatures_and_tabulars = reaction.xs
-
-        for temperature, tabular in temperatures_and_tabulars.items():
-            reaction_at_temperature_dict = {}
-
-            reaction_at_temperature_dict["interpolation"] = tabular.interpolation
-            reaction_at_temperature_dict["threshold_idx"] = tabular._threshold_idx
-            reaction_at_temperature_dict["xs"] = tabular.y
-
-            # Always use string keys for MTs
-            result["reactions"][temperature.replace("K", "")][
-                str(reaction_mt)
-            ] = reaction_at_temperature_dict
-
-    # After all explicit reactions are loaded, iteratively generate all possible hierarchical MTs
-    for temperature in result["reactions"]:
-        reactions_at_temp = result["reactions"][temperature]
-        available_mts = set(str(mt) for mt in reactions_at_temp.keys())
-        constructed = set()
-        print(f"\n--- Debug for temperature {temperature} ---")
-        print(f"Available MTs: {sorted(available_mts)}")
-        # Keep trying to build new MTs until no more can be built
-        while True:
-            added = False
-            # Work through sum rules in reverse order
-            for mt, children in reversed(list(SUM_RULES.items())):
-                mt_str = str(mt)
-                if mt_str in reactions_at_temp:
-                    continue  # Already present
-                present_children = [
-                    str(child) for child in children if str(child) in available_mts
-                ]
-                missing_children = [
-                    str(child) for child in children if str(child) not in available_mts
-                ]
-                if not present_children:
-                    print(
-                        f"Cannot construct MT {mt_str} at temperature {temperature}: no children available"
-                    )
-                    continue
-                # Get the energy grid for this temperature
-                energy_grid = result["energy"][temperature]
-                grid_len = len(energy_grid)
-                # Align all child xs arrays to the energy grid using threshold_idx
-                aligned_arrays = []
-                min_threshold_idx = grid_len  # Start with max possible
-                for child in present_children:
-                    child_xs = np.array(reactions_at_temp[child]["xs"])
-                    child_threshold_idx = reactions_at_temp[child]["threshold_idx"]
-                    min_threshold_idx = min(min_threshold_idx, child_threshold_idx)
-                    arr = np.zeros(grid_len)
-                    arr[child_threshold_idx : child_threshold_idx + len(child_xs)] = (
-                        child_xs
-                    )
-                    aligned_arrays.append(arr)
-                # Sum the aligned arrays
-                summed_xs_full = np.sum(aligned_arrays, axis=0)
-                # The hierarchical MT's threshold_idx is min of children
-                summed_xs = summed_xs_full[min_threshold_idx:]
-                interp = reactions_at_temp[present_children[0]]["interpolation"]
-                reactions_at_temp[mt_str] = {
-                    "interpolation": interp,
-                    "threshold_idx": min_threshold_idx,
-                    "xs": summed_xs.tolist(),
-                }
-                msg = f"Constructed new MT {mt_str} at temperature {temperature} using children {present_children}"
-                if missing_children:
-                    msg += f". Missing: {missing_children}"
-                print(msg)
-                available_mts.add(mt_str)
-                constructed.add(mt_str)
-                added = True
-            if not added:
-                break
-
+        if reaction.products:
+            neutron_products = []
+            
+            for product in reaction.products:
+                if product.particle == 'neutron':
+                    try:
+                        # Use monkey patch to convert product to dictionary
+                        product_dict = product.to_dict()
+                        neutron_products.append(product_dict)
+                    except Exception as e:
+                        print(f"  Warning: Could not extract product data for MT {reaction_mt}: {e}")
+            
+            if neutron_products:
+                # Add scattering data to each temperature for this reaction
+                for temperature in result["reactions"]:
+                    if str(reaction_mt) in result["reactions"][temperature]:
+                        result["reactions"][temperature][str(reaction_mt)]["products"] = neutron_products
+                scattering_count += 1
+    
+    if scattering_count > 0:
+        print(f"  Found scattering data for {scattering_count} reactions")
+    else:
+        print("  No scattering data found")
+    
+    # Set output filename
     if json_filename is None:
         json_filename = f"{isotope_object.name}.json"
-    # Sort MTs in each temperature's reactions by integer value before writing
+    
+    # Sort MTs numerically in each temperature before writing
     for temperature in result["reactions"]:
         reactions = result["reactions"][temperature]
-        # Sort keys numerically
         sorted_reactions = dict(sorted(reactions.items(), key=lambda x: int(x[0])))
         result["reactions"][temperature] = sorted_reactions
-
+    
+    # Write to JSON file using custom encoder
     with open(json_filename, "w") as f:
         json.dump(result, f, cls=CompactJSONEncoder, indent=2)
-
+    
     return result
 
-
-# first
-# pip install openmc_data
-# install njoy and openmc
-# generate_fendl -r 3.2c
 
 h5_files = glob.glob("fendl-3.2c-hdf5/*.h5")
 
 for i, file in enumerate(h5_files):
-    print(f"Processing file: {i} of {len(h5_files)}: {file}")
-    extract_cross_section_data(h5_filename=file)
+        print(f"Processing file {i+1}/{len(h5_files)}: {file}")
+        extract_cross_section_data(h5_filename=file, library="FENDL-3.2C")
